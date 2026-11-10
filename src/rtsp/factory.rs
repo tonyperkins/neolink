@@ -243,8 +243,7 @@ pub(super) async fn make_factory(
                         // Run blocking code on a seperate thread
                         // This is not an async thread
                         std::thread::spawn(move || {
-                            let mut aud_ts = 0u32;
-                            let mut vid_ts = 0u32;
+                            let mut clock = MediaClock::new(&stream_config);
                             let mut liveness = Liveness::new();
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
@@ -254,9 +253,7 @@ pub(super) async fn make_factory(
                                     &mut liveness,
                                     &vid_src,
                                     &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
-                                    &stream_config,
+                                    &mut clock,
                                 )?;
                             }
 
@@ -267,9 +264,7 @@ pub(super) async fn make_factory(
                                     &mut liveness,
                                     &vid_src,
                                     &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
-                                    &stream_config,
+                                    &mut clock,
                                 );
                                 if let Err(r) = &r {
                                     log::info!("{name}::{stream}: Stopping client feed: {r:?}");
@@ -356,58 +351,115 @@ impl Liveness {
     }
 }
 
+/// Gap in the camera's own frame clock beyond which we treat it as a
+/// discontinuity (camera restart, clock reset) and fall back to nominal fps.
+const MAX_CAMERA_FRAME_GAP_US: u64 = 2_000_000;
+
+/// Generates presentation timestamps for the RTSP stream.
+///
+/// Timestamps are `u64` microseconds. They used to be `u32`, which wraps after
+/// ~71.6 minutes and makes PTS/DTS jump backwards for long-running clients
+/// (seen downstream as "non-monotonic DTS").
+///
+/// Video uses the camera's own per-frame microsecond clock when it is
+/// available. The previous approach (frame count / reported fps) drifts badly
+/// when the reported fps is wrong; e.g. an E1 Pro reports 20 while sending 10,
+/// which made the stream play at half speed.
+struct MediaClock {
+    vid_ts: u64,
+    aud_ts: u64,
+    last_camera_us: Option<u32>,
+    nominal_frame_us: u64,
+    frames: u64,
+    camera_elapsed_us: u64,
+    reported_fps: u32,
+}
+
+impl MediaClock {
+    fn new(stream_config: &StreamConfig) -> Self {
+        let fps = stream_config.fps.max(1);
+        Self {
+            vid_ts: 0,
+            aud_ts: 0,
+            last_camera_us: None,
+            nominal_frame_us: 1_000_000 / fps as u64,
+            frames: 0,
+            camera_elapsed_us: 0,
+            reported_fps: stream_config.fps,
+        }
+    }
+
+    /// Timestamp for the next video frame, given the camera's frame clock
+    fn next_video(&mut self, camera_us: u32) -> Duration {
+        if let Some(last) = self.last_camera_us {
+            let delta = camera_us.wrapping_sub(last) as u64;
+            let step = if delta == 0 || delta > MAX_CAMERA_FRAME_GAP_US {
+                log::debug!(
+                    "Camera frame clock jumped by {delta}us, using nominal frame time"
+                );
+                self.nominal_frame_us
+            } else {
+                self.camera_elapsed_us += delta;
+                delta
+            };
+            self.vid_ts += step;
+        }
+        self.last_camera_us = Some(camera_us);
+        self.frames += 1;
+        if self.frames == 100 && self.camera_elapsed_us > 0 {
+            let observed_fps = 99.0 * 1_000_000.0 / self.camera_elapsed_us as f64;
+            log::info!(
+                "Camera reported {} fps, observed {:.1} fps from frame timestamps",
+                self.reported_fps,
+                observed_fps
+            );
+        }
+        Duration::from_micros(self.vid_ts)
+    }
+
+    /// Timestamp for the next audio packet, advancing by its duration
+    fn next_audio(&mut self, duration_us: Option<u32>) -> Duration {
+        let ts = Duration::from_micros(self.aud_ts);
+        // If the duration cannot be calculated (malformed header) assume a
+        // typical AAC frame rather than panicking the feeder thread
+        self.aud_ts += duration_us.unwrap_or(64_000) as u64;
+        ts
+    }
+}
+
 fn send_to_sources(
     data: BcMedia,
     liveness: &mut Liveness,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
-    vid_ts: &mut u32,
-    aud_ts: &mut u32,
-    stream_config: &StreamConfig,
+    clock: &mut MediaClock,
 ) -> AnyResult<()> {
-    // Update TS
     match data {
         BcMedia::Aac(aac) => {
-            let duration = aac.duration().expect("Could not calculate AAC duration");
+            let ts = clock.next_audio(aac.duration());
             if let Some(aud_src) = aud_src.as_ref() {
-                log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(
-                    aud_src,
-                    aac.data,
-                    Duration::from_micros(*aud_ts as u64),
-                    liveness,
-                )?;
+                log::trace!("Sending AAC: {:?}", ts);
+                send_to_appsrc(aud_src, aac.data, ts, liveness)?;
             }
-            *aud_ts += duration;
         }
         BcMedia::Adpcm(adpcm) => {
-            let duration = adpcm
-                .duration()
-                .expect("Could not calculate ADPCM duration");
+            let ts = clock.next_audio(adpcm.duration());
             if let Some(aud_src) = aud_src.as_ref() {
-                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(
-                    aud_src,
-                    adpcm.data,
-                    Duration::from_micros(*aud_ts as u64),
-                    liveness,
-                )?;
+                log::trace!("Sending ADPCM: {:?}", ts);
+                send_to_appsrc(aud_src, adpcm.data, ts, liveness)?;
             }
-            *aud_ts += duration;
         }
-        BcMedia::Iframe(BcMediaIframe { data, .. })
-        | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
+        BcMedia::Iframe(BcMediaIframe {
+            data, microseconds, ..
+        })
+        | BcMedia::Pframe(BcMediaPframe {
+            data, microseconds, ..
+        }) => {
+            let ts = clock.next_video(microseconds);
             if let Some(vid_src) = vid_src.as_ref() {
-                log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts as u64));
-                send_to_appsrc(
-                    vid_src,
-                    data,
-                    Duration::from_micros(*vid_ts as u64),
-                    liveness,
-                )?;
+                log::trace!("Sending VID: {:?}", ts);
+                send_to_appsrc(vid_src, data, ts, liveness)?;
             }
-            const MICROSECONDS: u32 = 1000000;
-            *vid_ts += MICROSECONDS / stream_config.fps;
         }
         _ => {}
     }
@@ -568,7 +620,7 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
 
     source.set_is_live(false);
     source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
+    source.set_min_latency(1000 / (stream_config.fps.max(1) as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
@@ -623,7 +675,7 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
     source.set_is_live(false);
     source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
+    source.set_min_latency(1000 / (stream_config.fps.max(1) as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
@@ -680,7 +732,7 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
 
     source.set_is_live(false);
     source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
+    source.set_min_latency(1000 / (stream_config.fps.max(1) as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
@@ -770,7 +822,7 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
     source.set_is_live(false);
     source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
+    source.set_min_latency(1000 / (stream_config.fps.max(1) as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
@@ -846,7 +898,7 @@ fn pipe_silence(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
 
     source.set_is_live(false);
     source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
+    source.set_min_latency(1000 / (stream_config.fps.max(1) as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
