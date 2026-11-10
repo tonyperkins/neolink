@@ -71,10 +71,16 @@ impl NeoCamThread {
                             missed_pings = 0;
                             continue
                         },
-                        Ok(Err(neolink_core::Error::UnintelligibleReply { reply, why })) => {
-                            // Camera does not support pings just wait forever
-                            log::trace!("Pings not supported: {reply:?}: {why}");
-                            futures::future::pending().await
+                        // Any reply shows the camera is there. A reply we could
+                        // not parse used to stop pinging for good (so a dead link
+                        // went unnoticed), and a refused ping (e.g. a 400) dropped
+                        // the connection every 5s. (From
+                        // victorpicaud/neolink@9104aee.)
+                        Ok(Err(e @ (neolink_core::Error::UnintelligibleReply { .. }
+                        | neolink_core::Error::CameraServiceUnavailable { .. }))) => {
+                            log::trace!("Ping answered without a link type: {e}");
+                            missed_pings = 0;
+                            continue
                         },
                         Ok(Err(e)) => {
                             break Err(e.into());
@@ -209,11 +215,13 @@ async fn update_camera_time(camera: &BcCamera, name: &str, update_time: bool) ->
         log::warn!("{}: Camera has no time set, Updating", name);
     }
     if update {
-        use std::time::SystemTime;
-        let new_time = SystemTime::now();
+        // Keep the camera's own time zone: setting the time in UTC reset the
+        // camera's time zone to UTC. (From victorpicaud/neolink@b871eef.)
+        let offset = cam_time.map_or(time::UtcOffset::UTC, |time| time.offset());
+        let new_time = time::OffsetDateTime::now_utc().to_offset(offset);
 
-        log::info!("{}: Setting time to {:?}", name, new_time);
-        match camera.set_time(new_time.into()).await {
+        log::info!("{}: Setting time to {}", name, new_time);
+        match camera.set_time(new_time).await {
             Ok(_) => {
                 let cam_time = camera.get_time().await?;
                 if let Some(time) = cam_time {
