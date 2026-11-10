@@ -172,6 +172,7 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
                             let name = name.clone();
                             set.spawn(async move {
                                 let camera = thread_reactor2.get(&name).await?;
+                                let global_config = thread_reactor2.config().await?;
                                 tokio::select!(
                                     _ = thread_global_cancel.cancelled() => {
                                         AnyResult::Ok(())
@@ -179,7 +180,9 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
                                     _ = local_cancel.cancelled() => {
                                         AnyResult::Ok(())
                                     },
-                                    v = camera_main(camera, &thread_rtsp2) => v,
+                                    v = camera_main(camera.clone(), &thread_rtsp2) => v,
+                                    // Only returns on a fatal error; idles without onvif_port
+                                    v = crate::onvif::serve(camera, global_config) => v,
                                 )
                             }) ;
                         }

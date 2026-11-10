@@ -387,6 +387,7 @@ enabled = true # Enable or Disable the camera
 update_time = false # When camera connects, force the setting of the camera date/time to now. The default is false
 print_format = "None"  # Type of format that logs are displayed in (None, Human, Xml). The default is None
 audio = "pcm" # Audio on the RTSP stream: "pcm" (default), "aac" or "none"
+onvif_port = 8001 # Serve ONVIF PTZ on this port (see ONVIF PTZ below). Off by default
 ```
 
 - **Debug:** Will dump the various XMLs from the camera as they are recieved
@@ -414,6 +415,40 @@ messages
   PCM cannot be stored in MP4, so recorders such as Frigate either have to
   transcode it or fail on it. With `"aac"` the stream can be recorded with
   `-c copy`.
+
+### ONVIF PTZ
+
+Neolink can serve a small ONVIF service for a camera so that ONVIF clients
+such as Frigate can pan, tilt and recall presets. This gives PTZ control to
+cameras without ONVIF of their own (e.g. the original E1). Commands go to the
+camera over neolink's existing connection.
+
+```toml
+[[cameras]]
+name = "Camera01"
+onvif_port = 8001 # one port per camera, on the global `bind` address
+```
+
+Then point the client at that port, e.g. in Frigate:
+
+```yaml
+cameras:
+  Camera01:
+    onvif:
+      host: 127.0.0.1 # the neolink host
+      port: 8001
+      user: frigate # a neolink [[users]] entry; omit both if there are none
+      password: "{FRIGATE_PASSWORD}"
+```
+
+- Authentication uses the same `[[users]]` and `permitted_users` as RTSP
+  (WS-Security digest or text). Without any `[[users]]` anyone may connect.
+- Supported: pan/tilt (ContinuousMove and Stop), presets (GetPresets and
+  GotoPreset; save presets with `neolink ptz` or the Reolink app), plus the
+  device and media calls clients use to set up (profiles, stream URIs, etc.).
+- Not supported: zoom, absolute and relative moves, so Frigate's
+  autotracking does not work. The camera does not report its position.
+- A move with no `Stop` ends after its ONVIF timeout (10 s by default).
 
 ### Pause
 

@@ -36,6 +36,7 @@ regex = "1.7.3"
 rumqttc = "0.24.0"
 serde = { version = "1.0.160", features = ["derive"] }
 serde_json = "1.0.96"
+sha1 = { version = "0.10.6", optional = true }
 time = "0.3.36"
 tokio = { version = "1.27.0", features = ["rt-multi-thread", "macros", "io-util", "tracing"] }
 tokio-stream = "0.1.12"
@@ -55,7 +56,8 @@ gstreamer = [
   "dep:gstreamer-rtsp",
   "dep:gstreamer-rtsp-server",
   "dep:byte-slice-cast",
-  "dep:crossbeam-channel"
+  "dep:crossbeam-channel",
+  "dep:sha1"
 ]
 pushnoti = [
   "dep:fcm-push-listener",

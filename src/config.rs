@@ -160,6 +160,10 @@ pub(crate) struct CameraConfig {
     #[serde(default = "default_stream")]
     pub(crate) stream: StreamConfig,
 
+    /// Serve an ONVIF PTZ service for this camera on this port
+    #[serde(default)]
+    pub(crate) onvif_port: Option<u16>,
+
     /// Audio served on the RTSP stream: "pcm" (default), "aac" or "none"
     #[serde(default)]
     pub(crate) audio: AudioFormat,
