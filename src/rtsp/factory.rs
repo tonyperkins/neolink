@@ -12,6 +12,7 @@ use neolink_core::{
 };
 use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
 
+use super::hub::StreamHub;
 use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
 
 #[derive(Clone, Debug)]
@@ -146,7 +147,7 @@ pub(super) async fn make_dummy_factory(
 enum ClientMsg {
     NewClient {
         element: Element,
-        reply: tokio::sync::oneshot::Sender<Element>,
+        reply: std::sync::mpsc::SyncSender<Element>,
     },
 }
 
@@ -158,6 +159,7 @@ pub(super) async fn make_factory(
     // Create the task that creates the pipelines
     let thread = tokio::task::spawn(async move {
         let name = camera.config().await?.borrow().name.clone();
+        let hub = StreamHub::new(camera.clone(), stream, name.clone());
 
         while let Some(msg) = client_rx.recv().await {
             match msg {
@@ -165,13 +167,14 @@ pub(super) async fn make_factory(
                     log::debug!("New client for {name}::{stream}");
                     let camera = camera.clone();
                     let name = name.clone();
+                    let hub = hub.clone();
                     tokio::task::spawn(async move {
                         clear_bin(&element)?;
                         log::trace!("{name}::{stream}: Starting camera");
 
                         // Start the camera
                         let config = camera.config().await?.borrow().clone();
-                        let mut media_rx = camera.stream_while_live(stream).await?;
+                        let mut media_rx = hub.subscribe();
 
                         log::trace!("{name}::{stream}: Learning camera stream type");
                         // Learn the camera data type
@@ -238,7 +241,13 @@ pub(super) async fn make_factory(
 
                         log::trace!("{name}::{stream}: Sending pipeline to gstreamer");
                         // Send the pipeline back to the factory so it can start
-                        let _ = reply.send(element);
+                        if reply.send(element).is_err() {
+                            // The factory gave up waiting; don't start a feeder for
+                            // a pipeline nobody will use
+                            log::debug!("{name}::{stream}: Factory stopped waiting for pipeline");
+                            return AnyResult::Ok(());
+                        }
+                        let runtime = tokio::runtime::Handle::current();
 
                         // Run blocking code on a seperate thread
                         // This is not an async thread
@@ -258,14 +267,29 @@ pub(super) async fn make_factory(
                             }
 
                             log::trace!("{name}::{stream}: Sending new frames");
-                            while let Some(data) = media_rx.blocking_recv() {
-                                let r = send_to_sources(
-                                    data,
-                                    &mut liveness,
-                                    &vid_src,
-                                    &aud_src,
-                                    &mut clock,
-                                );
+                            loop {
+                                // Wait with a timeout so the pipeline is still checked
+                                // while the camera is quiet (paused, reconnecting)
+                                // The timer must be created inside the runtime context
+                                let r = match runtime.block_on(async {
+                                    tokio::time::timeout(Duration::from_secs(5), media_rx.recv())
+                                        .await
+                                }) {
+                                    Ok(Some(data)) => send_to_sources(
+                                        data,
+                                        &mut liveness,
+                                        &vid_src,
+                                        &aud_src,
+                                        &mut clock,
+                                    ),
+                                    Ok(None) => break,
+                                    Err(_) => match vid_src.as_ref().or(aud_src.as_ref()) {
+                                        Some(src) => {
+                                            check_live(src).and_then(|_| liveness.check(src))
+                                        }
+                                        None => Ok(()),
+                                    },
+                                };
                                 if let Err(r) = &r {
                                     log::info!("{name}::{stream}: Stopping client feed: {r:?}");
                                 }
@@ -284,15 +308,22 @@ pub(super) async fn make_factory(
 
     // Now setup the factory
     let factory = NeoMediaFactory::new_with_callback(move |element| {
-        let (reply, new_element) = tokio::sync::oneshot::channel();
+        // This runs on the RTSP server's main loop, so a hang here stalls every
+        // client of every camera. Bound the wait.
+        let (reply, new_element) = std::sync::mpsc::sync_channel(1);
         client_tx.blocking_send(ClientMsg::NewClient { element, reply })?;
 
-        let element = new_element.blocking_recv()?;
+        let element = new_element
+            .recv_timeout(PIPELINE_BUILD_TIMEOUT)
+            .map_err(|e| anyhow!("Pipeline was not ready in time: {e}"))?;
         Ok(Some(element))
     })
     .await?;
     Ok((factory, thread))
 }
+
+/// How long an RTSP request may wait for the camera stream to be ready
+const PIPELINE_BUILD_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long the pipeline may sit below PAUSED (after having played)
 /// before we assume the client has gone and stop feeding it.
@@ -394,9 +425,7 @@ impl MediaClock {
         if let Some(last) = self.last_camera_us {
             let delta = camera_us.wrapping_sub(last) as u64;
             let step = if delta == 0 || delta > MAX_CAMERA_FRAME_GAP_US {
-                log::debug!(
-                    "Camera frame clock jumped by {delta}us, using nominal frame time"
-                );
+                log::debug!("Camera frame clock jumped by {delta}us, using nominal frame time");
                 self.nominal_frame_us
             } else {
                 self.camera_elapsed_us += delta;
