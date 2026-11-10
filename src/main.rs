@@ -43,6 +43,8 @@ mod config;
 #[cfg(feature = "gstreamer")]
 mod image;
 mod mqtt;
+#[cfg(feature = "gstreamer")]
+mod onvif;
 mod pir;
 mod ptz;
 mod reboot;

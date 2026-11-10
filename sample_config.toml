@@ -63,6 +63,10 @@ address = "192.168.1.187:9000"
 # recorders that store MP4 (e.g. Frigate), which cannot hold PCM.
 # audio = "aac"
 
+# Serve an ONVIF PTZ service for this camera (pan/tilt and presets) on this
+# port, e.g. for Frigate's PTZ controls. Uses the [[users]] above for login.
+# onvif_port = 8001
+
 # By default neolink will use any means to connect to the camera
 # from a UID
 # This include relaying via reolink servers

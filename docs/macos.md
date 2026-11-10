@@ -131,7 +131,7 @@ If Frigate runs in a container on the same Mac, use `host.docker.internal` inste
 ## Troubleshooting
 
 - **Stream freezes a few seconds after starting, or recordings fail**: usually the PCM audio. Set `audio = "aac"` (or `"none"`) in `neolink.toml`, or convert it with `#audio=aac` in go2rtc.
-- **No PTZ controls in Frigate**: Frigate only controls PTZ over ONVIF, and neolink does not provide ONVIF. Cameras without ONVIF (e.g. the original E1) can be moved with `neolink ptz <camera> control 10 left` or over MQTT (`neolink/<camera>/control/ptz`).
+- **No PTZ controls in Frigate**: Frigate only controls PTZ over ONVIF. For cameras without ONVIF (e.g. the original E1), add `onvif_port = 8001` (a different port per camera) to the camera in `neolink.toml` and point Frigate's `onvif:` at `127.0.0.1` and that port; see "ONVIF PTZ" in the README. Pan, tilt and presets work; autotracking does not.
 
 - **"Local Network" permission.** Recent macOS versions ask before a program talks to devices on the LAN. If neolink logs that it cannot connect to the camera, check System Settings → Privacy & Security → Local Network. Running it once from Terminal (step 3) usually triggers the prompt.
 - **Missing GStreamer elements** (e.g. `no element "rtph264pay"`): run `brew reinstall gstreamer`, then check with `gst-inspect-1.0` as in step 1.
