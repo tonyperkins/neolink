@@ -33,9 +33,10 @@ jobs:
       matrix:
         # Windows is not built: it needs its GStreamer install repaired, and no one
         # using this fork runs it. Re-add windows-2022 if that changes.
-        # macos-14 is Apple Silicon (arm64). macos-15 arm64 runners were often
-        # never assigned ("capacity constraints"), cancelling the job.
-        os: [ubuntu-22.04, macos-14]
+        # macos-15 is Apple Silicon (arm64); macos-14 is retired. If the macOS job
+        # is cancelled with "not acquired by Runner", GitHub had no arm64 runner
+        # free: re-run that job.
+        os: [ubuntu-22.04, macos-15]
     steps:
       - uses: actions/checkout@v4
         name: Checkout onto ${{ runner.os }}
