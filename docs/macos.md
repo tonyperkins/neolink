@@ -47,6 +47,7 @@ username = "admin"
 password = "{CAMERA_PASSWORD}"
 address = "192.168.1.50:9000"    # the camera's IP; Baichuan port 9000
 stream = "both"                  # serves /living_room/main and /living_room/sub
+audio = "aac"                    # MP4-friendly audio; "none" for no audio
 push_notifications = false
 ```
 
@@ -121,11 +122,16 @@ go2rtc:
       - ffmpeg:rtsp://127.0.0.1:8554/living_room/sub#video=copy
 ```
 
+With `audio = "aac"` the audio can be copied as is, e.g. `ffmpeg:rtsp://127.0.0.1:8554/living_room/main#video=copy#audio=copy`. With the default PCM audio, keep `#audio=aac` so go2rtc converts it: Frigate stores recordings as MP4, which cannot hold PCM.
+
 This also works with [Fregata](https://fregata.app), a native macOS port of Frigate, running on the same Mac. It reads a standard Frigate config, so `127.0.0.1` reaches neolink directly.
 
 If Frigate runs in a container on the same Mac, use `host.docker.internal` instead of `127.0.0.1`, and set `bind = "0.0.0.0"` in `neolink.toml`.
 
 ## Troubleshooting
+
+- **Stream freezes a few seconds after starting, or recordings fail**: usually the PCM audio. Set `audio = "aac"` (or `"none"`) in `neolink.toml`, or convert it with `#audio=aac` in go2rtc.
+- **No PTZ controls in Frigate**: Frigate only controls PTZ over ONVIF, and neolink does not provide ONVIF. Cameras without ONVIF (e.g. the original E1) can be moved with `neolink ptz <camera> control 10 left` or over MQTT (`neolink/<camera>/control/ptz`).
 
 - **"Local Network" permission.** Recent macOS versions ask before a program talks to devices on the LAN. If neolink logs that it cannot connect to the camera, check System Settings → Privacy & Security → Local Network. Running it once from Terminal (step 3) usually triggers the prompt.
 - **Missing GStreamer elements** (e.g. `no element "rtph264pay"`): run `brew reinstall gstreamer`, then check with `gst-inspect-1.0` as in step 1.

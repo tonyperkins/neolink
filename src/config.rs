@@ -100,6 +100,21 @@ pub(crate) enum StreamConfig {
     Extern,
 }
 
+/// Audio format served on the RTSP stream
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Eq, PartialEq, Default)]
+pub(crate) enum AudioFormat {
+    /// Uncompressed 16-bit PCM (L16), as neolink has always served
+    #[default]
+    #[serde(alias = "pcm", alias = "PCM", alias = "l16", alias = "L16")]
+    Pcm,
+    /// AAC: passed through if the camera sends AAC, otherwise encoded
+    #[serde(alias = "aac", alias = "AAC")]
+    Aac,
+    /// No audio track
+    #[serde(alias = "none", alias = "off", alias = "disabled")]
+    None,
+}
+
 impl StreamConfig {
     #[cfg(feature = "gstreamer")]
     pub(crate) fn as_stream_kinds(&self) -> Vec<StreamKind> {
@@ -144,6 +159,10 @@ pub(crate) struct CameraConfig {
 
     #[serde(default = "default_stream")]
     pub(crate) stream: StreamConfig,
+
+    /// Audio served on the RTSP stream: "pcm" (default), "aac" or "none"
+    #[serde(default)]
+    pub(crate) audio: AudioFormat,
 
     pub(crate) permitted_users: Option<Vec<String>>,
 
@@ -531,5 +550,32 @@ fn validate_camera_config(camera_config: &CameraConfig) -> Result<(), Validation
             "Either camera address or uid must be given",
         )),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod audio_tests {
+    use super::AudioFormat;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct Wrap {
+        #[serde(default)]
+        audio: AudioFormat,
+    }
+
+    fn parse(s: &str) -> AudioFormat {
+        toml::from_str::<Wrap>(s).unwrap().audio
+    }
+
+    #[test]
+    fn audio_format_parses() {
+        assert_eq!(parse(""), AudioFormat::Pcm);
+        assert_eq!(parse(r#"audio = "pcm""#), AudioFormat::Pcm);
+        assert_eq!(parse(r#"audio = "aac""#), AudioFormat::Aac);
+        assert_eq!(parse(r#"audio = "AAC""#), AudioFormat::Aac);
+        assert_eq!(parse(r#"audio = "none""#), AudioFormat::None);
+        assert_eq!(parse(r#"audio = "off""#), AudioFormat::None);
+        assert!(toml::from_str::<Wrap>(r#"audio = "mp3""#).is_err());
     }
 }

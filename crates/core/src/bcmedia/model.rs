@@ -279,16 +279,36 @@ pub struct BcMediaAdpcm {
 impl BcMediaAdpcm {
     /// The block size, this is bytes without the block header
     pub fn block_size(&self) -> u32 {
-        self.data.len() as u32 - 4
+        (self.data.len() as u32).saturating_sub(4)
     }
 
     /// Returns duration in micro seconds;
     pub fn duration(&self) -> Option<u32> {
-        let samples = self.block_size() * 2;
+        // The header holds the first sample, then two samples per byte
+        let samples = self.block_size() * 2 + 1;
         // Always 8000Hz for ADPCM
         const SAMPLE_FREQUENCY: u32 = 8000;
         const MICROSECONDS: u32 = 1000000;
         let duration = samples * MICROSECONDS / SAMPLE_FREQUENCY;
         Some(duration)
+    }
+}
+
+#[cfg(test)]
+mod adpcm_tests {
+    use super::BcMediaAdpcm;
+
+    #[test]
+    fn dvi_block_duration_counts_header_sample() {
+        // 4 byte header + 508 bytes = 1017 samples at 8 kHz
+        let adpcm = BcMediaAdpcm { data: vec![0; 512] };
+        assert_eq!(adpcm.block_size(), 508);
+        assert_eq!(adpcm.duration(), Some(1017 * 1_000_000 / 8000));
+    }
+
+    #[test]
+    fn short_block_does_not_underflow() {
+        let adpcm = BcMediaAdpcm { data: vec![0; 2] };
+        assert_eq!(adpcm.block_size(), 0);
     }
 }

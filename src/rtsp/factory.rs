@@ -13,7 +13,7 @@ use neolink_core::{
 use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
 
 use super::hub::StreamHub;
-use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
+use crate::{common::NeoInstance, config::AudioFormat, rtsp::gst::NeoMediaFactory, AnyResult};
 
 #[derive(Clone, Debug)]
 pub enum AudioType {
@@ -231,17 +231,34 @@ pub(super) async fn make_factory(
                         }?;
 
                         // Build the right audio pipeline
-                        let aud_src = match stream_config.aud_type.as_ref() {
-                            Some(AudioType::Aac) => {
-                                let src = build_aac(&element, &stream_config)?;
-                                AnyResult::Ok(Some(src))
+                        let aud_src = match (config.audio, stream_config.aud_type.as_ref()) {
+                            (AudioFormat::None, _) | (_, None) => None,
+                            (AudioFormat::Pcm, Some(AudioType::Aac)) => {
+                                Some(build_aac(&element, &stream_config)?)
                             }
-                            Some(AudioType::Adpcm(block_size)) => {
-                                let src = build_adpcm(&element, *block_size, &stream_config)?;
-                                AnyResult::Ok(Some(src))
+                            (AudioFormat::Pcm, Some(AudioType::Adpcm(block_size))) => {
+                                Some(build_adpcm(&element, *block_size, &stream_config)?)
                             }
-                            None => AnyResult::Ok(None),
-                        }?;
+                            (AudioFormat::Aac, Some(AudioType::Aac)) => {
+                                Some(build_aac_passthrough(&element, &stream_config)?)
+                            }
+                            (AudioFormat::Aac, Some(AudioType::Adpcm(block_size))) => {
+                                match make_aac_encoder() {
+                                    Some(encoder) => Some(build_adpcm_to_aac(
+                                        &element,
+                                        *block_size,
+                                        encoder,
+                                        &stream_config,
+                                    )?),
+                                    None => {
+                                        log::warn!(
+                                            "{name}::{stream}: audio = \"aac\" but no AAC encoder (avenc_aac, fdkaacenc, voaacenc or faac) is installed; serving PCM"
+                                        );
+                                        Some(build_adpcm(&element, *block_size, &stream_config)?)
+                                    }
+                                }
+                            }
+                        };
 
                         if let Some(app) = vid_src.as_ref() {
                             app.set_callbacks(
@@ -873,7 +890,7 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
     log::debug!("Building Adpcm pipeline");
     // Original command line
-    // caps=audio/x-adpcm,layout=dvi,block_align={},channels=1,rate=8000
+    // caps=audio/x-adpcm,layout=dvi,block_align={block_size + 4},channels=1,rate=8000
     // ! queue silent=true max-size-bytes=10485760 min-threshold-bytes=1024
     // ! adpcmdec
     // ! audioconvert
@@ -895,9 +912,13 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
     source.set_leaky_type(AppLeakyType::Downstream);
 
     source.set_caps(Some(
+        // A DVI block is the 4 byte predictor header plus `block_size` bytes
+        // of samples, and block_align counts the whole block. (This was
+        // "div" with the header excluded, so no decoder ever matched and
+        // ADPCM cameras had no audio.)
         &Caps::builder("audio/x-adpcm")
-            .field("layout", "div")
-            .field("block_align", block_size as i32)
+            .field("layout", "dvi")
+            .field("block_align", (block_size + 4) as i32)
             .field("channels", 1i32)
             .field("rate", 8000i32)
             .build(),
@@ -942,6 +963,101 @@ fn build_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> 
     let payload = make_element("rtpL16pay", "pay1")?;
     bin.add_many([&payload])?;
     Element::link_many([&linked.output, &payload])?;
+    Ok(linked.appsrc)
+}
+
+/// AAC bitrate when encoding the camera's 8 kHz mono ADPCM
+const AAC_ENCODE_BITRATE: i32 = 32_000;
+
+/// Finds an installed AAC encoder, best first
+fn make_aac_encoder() -> Option<Element> {
+    ["fdkaacenc", "avenc_aac", "voaacenc", "faac"]
+        .iter()
+        .find_map(|name| {
+            let encoder = ElementFactory::make(name).name("audaacenc").build().ok()?;
+            if let Some(spec) = encoder.find_property("bitrate") {
+                if spec.value_type() == i32::static_type() {
+                    encoder.set_property("bitrate", AAC_ENCODE_BITRATE);
+                } else if spec.value_type() == i64::static_type() {
+                    encoder.set_property("bitrate", AAC_ENCODE_BITRATE as i64);
+                } else if spec.value_type() == u32::static_type() {
+                    encoder.set_property("bitrate", AAC_ENCODE_BITRATE as u32);
+                }
+            }
+            log::debug!("Using {name} to encode AAC");
+            Some(encoder)
+        })
+}
+
+/// An audio appsrc configured like the ones in the PCM pipelines
+fn make_audio_appsrc(buffer_size: u32, stream_config: &StreamConfig) -> Result<AppSrc> {
+    let source = make_element("appsrc", "audsrc")?
+        .dynamic_cast::<AppSrc>()
+        .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
+    source.set_is_live(false);
+    source.set_block(false);
+    source.set_min_latency(1000 / (stream_config.fps.max(1) as i64));
+    source.set_property("emit-signals", false);
+    source.set_max_bytes(buffer_size as u64);
+    source.set_do_timestamp(false);
+    source.set_stream_type(AppStreamType::Stream);
+    // Bounded: drop old buffers rather than grow when a client is slow
+    source.set_leaky_type(AppLeakyType::Downstream);
+    Ok(source)
+}
+
+/// Serves the camera's own AAC without decoding it
+fn build_aac_passthrough(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
+    let buffer_size = 512 * 1416;
+    let bin = bin
+        .clone()
+        .dynamic_cast::<Bin>()
+        .map_err(|_| anyhow!("Media source's element should be a bin"))?;
+    log::debug!("Building Aac passthrough pipeline");
+    let source = make_audio_appsrc(buffer_size, stream_config)?;
+    // The camera sends ADTS framed AAC (see BcMediaAac::duration)
+    source.set_caps(Some(
+        &Caps::builder("audio/mpeg")
+            .field("mpegversion", 4i32)
+            .field("stream-format", "adts")
+            .build(),
+    ));
+    let source = source
+        .dynamic_cast::<Element>()
+        .map_err(|_| anyhow!("Cannot cast back"))?;
+
+    let queue = make_queue("audqueue", buffer_size)?;
+    // aacparse converts ADTS to the raw AAC + codec_data the payloader needs
+    let parser = make_element("aacparse", "audparser")?;
+    let payload = make_element("rtpmp4gpay", "pay1")?;
+    bin.add_many([&source, &queue, &parser, &payload])?;
+    Element::link_many([&source, &queue, &parser, &payload])?;
+
+    source
+        .dynamic_cast::<AppSrc>()
+        .map_err(|_| anyhow!("Cannot convert appsrc"))
+}
+
+/// Decodes the camera's ADPCM and serves it as AAC
+fn build_adpcm_to_aac(
+    bin: &Element,
+    block_size: u32,
+    encoder: Element,
+    stream_config: &StreamConfig,
+) -> Result<AppSrc> {
+    let linked = pipe_adpcm(bin, block_size, stream_config)?;
+
+    let bin = bin
+        .clone()
+        .dynamic_cast::<Bin>()
+        .map_err(|_| anyhow!("Media source's element should be a bin"))?;
+
+    // Resample in case the encoder does not accept 8 kHz
+    let resample = make_element("audioresample", "audresample")?;
+    let parser = make_element("aacparse", "audparser")?;
+    let payload = make_element("rtpmp4gpay", "pay1")?;
+    bin.add_many([&resample, &encoder, &parser, &payload])?;
+    Element::link_many([&linked.output, &resample, &encoder, &parser, &payload])?;
     Ok(linked.appsrc)
 }
 
@@ -1060,6 +1176,8 @@ fn make_element(kind: &str, name: &str) -> AnyResult<Element> {
             "rtpjitterbuffer" => "rtp (gst-plugins-good)",
             "aacparse" => "audioparsers (gst-plugins-good)",
             "rtpL16pay" => "rtp (gst-plugins-good)",
+            "rtpmp4gpay" => "rtp (gst-plugins-good)",
+            "audioresample" => "audioresample (gst-plugins-base)",
             "x264enc" => "x264 (gst-plugins-ugly)",
             "x265enc" => "x265 (gst-plugins-bad)",
             "avdec_h264" => "libav (gst-libav)",
