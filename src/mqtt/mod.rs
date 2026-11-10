@@ -354,6 +354,10 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                             v = async {
                                 log::debug!("Listening to message on {}", mqtt_msg.get_name());
                                 while let Ok(msg) = mqtt_msg.recv().await {
+                                    // Reap finished handlers. A JoinSet keeps every completed
+                                    // task until it is joined, so without this it grows by one
+                                    // entry per MQTT message (including our own echoed publishes).
+                                    while set_msg.try_join_next().is_some() {}
                                     let mqtt_msg = mqtt_msg.resubscribe().await?;
                                     let camera_msg = camera_msg.clone();
                                     let tx = tx.clone();

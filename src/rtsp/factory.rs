@@ -1,9 +1,9 @@
 use gstreamer::ClockTime;
-use std::{collections::HashMap, time::Duration};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, FlowError, GhostPad};
-use gstreamer_app::{AppSrc, AppSrcCallbacks, AppStreamType};
+use gstreamer_app::{AppLeakyType, AppSrc, AppSrcCallbacks, AppStreamType};
 use neolink_core::{
     bc_protocol::StreamKind,
     bcmedia::model::{
@@ -245,13 +245,13 @@ pub(super) async fn make_factory(
                         std::thread::spawn(move || {
                             let mut aud_ts = 0u32;
                             let mut vid_ts = 0u32;
-                            let mut pools = Default::default();
+                            let mut liveness = Liveness::new();
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
                                 send_to_sources(
                                     buffered,
-                                    &mut pools,
+                                    &mut liveness,
                                     &vid_src,
                                     &aud_src,
                                     &mut vid_ts,
@@ -264,7 +264,7 @@ pub(super) async fn make_factory(
                             while let Some(data) = media_rx.blocking_recv() {
                                 let r = send_to_sources(
                                     data,
-                                    &mut pools,
+                                    &mut liveness,
                                     &vid_src,
                                     &aud_src,
                                     &mut vid_ts,
@@ -272,7 +272,7 @@ pub(super) async fn make_factory(
                                     &stream_config,
                                 );
                                 if let Err(r) = &r {
-                                    log::info!("Failed to send to source: {r:?}");
+                                    log::info!("{name}::{stream}: Stopping client feed: {r:?}");
                                 }
                                 r?;
                             }
@@ -299,9 +299,66 @@ pub(super) async fn make_factory(
     Ok((factory, thread))
 }
 
+/// How long the pipeline may sit below PAUSED (after having played)
+/// before we assume the client has gone and stop feeding it.
+///
+/// The RTSP server legitimately drops the pipeline to NULL for short periods
+/// (e.g. suspend between SETUP and PLAY), so this cannot be instant.
+const STOPPED_GRACE: Duration = Duration::from_secs(30);
+/// How long we wait for a new pipeline to reach PAUSED/PLAYING at all.
+const STARTUP_GRACE: Duration = Duration::from_secs(60);
+
+/// Tracks whether the gstreamer pipeline we are feeding is still in use.
+///
+/// Without this, the feeder thread (and the camera stream, pipeline and
+/// buffers it holds) outlives a disconnected client, because pushing into a
+/// stopped appsrc just returns `Flushing`.
+struct Liveness {
+    created: Instant,
+    started: bool,
+    stopped_since: Option<Instant>,
+}
+
+impl Liveness {
+    fn new() -> Self {
+        Self {
+            created: Instant::now(),
+            started: false,
+            stopped_since: None,
+        }
+    }
+
+    fn check(&mut self, appsrc: &AppSrc) -> Result<()> {
+        let now = Instant::now();
+        if matches!(
+            appsrc.current_state(),
+            gstreamer::State::Paused | gstreamer::State::Playing
+        ) {
+            self.started = true;
+            self.stopped_since = None;
+        } else if self.started {
+            let since = *self.stopped_since.get_or_insert(now);
+            if now.duration_since(since) > STOPPED_GRACE {
+                return Err(anyhow!(
+                    "{} has been stopped for over {:?}, client has gone",
+                    appsrc.name(),
+                    STOPPED_GRACE
+                ));
+            }
+        } else if now.duration_since(self.created) > STARTUP_GRACE {
+            return Err(anyhow!(
+                "{} never started within {:?}",
+                appsrc.name(),
+                STARTUP_GRACE
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn send_to_sources(
     data: BcMedia,
-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
+    liveness: &mut Liveness,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
     vid_ts: &mut u32,
@@ -318,7 +375,7 @@ fn send_to_sources(
                     aud_src,
                     aac.data,
                     Duration::from_micros(*aud_ts as u64),
-                    pools,
+                    liveness,
                 )?;
             }
             *aud_ts += duration;
@@ -333,7 +390,7 @@ fn send_to_sources(
                     aud_src,
                     adpcm.data,
                     Duration::from_micros(*aud_ts as u64),
-                    pools,
+                    liveness,
                 )?;
             }
             *aud_ts += duration;
@@ -342,7 +399,12 @@ fn send_to_sources(
         | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
             if let Some(vid_src) = vid_src.as_ref() {
                 log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts as u64));
-                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64), pools)?;
+                send_to_appsrc(
+                    vid_src,
+                    data,
+                    Duration::from_micros(*vid_ts as u64),
+                    liveness,
+                )?;
             }
             const MICROSECONDS: u32 = 1000000;
             *vid_ts += MICROSECONDS / stream_config.fps;
@@ -356,9 +418,10 @@ fn send_to_appsrc(
     appsrc: &AppSrc,
     data: Vec<u8>,
     mut ts: Duration,
-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
+    liveness: &mut Liveness,
 ) -> AnyResult<()> {
-    check_live(appsrc)?; // Stop if appsrc is dropped
+    check_live(appsrc)?; // Stop if appsrc is unlinked
+    liveness.check(appsrc)?; // Stop if the pipeline has been torn down
 
     // In live mode we follow the advice in
     // https://gstreamer.freedesktop.org/documentation/additional/design/element-source.html?gi-language=c#live-sources
@@ -380,34 +443,19 @@ fn send_to_appsrc(
             return Ok(());
         }
     }
+    // Wrap the data directly in a gstreamer buffer (no copy).
+    //
+    // Previously a BufferPool was created for every distinct frame size and
+    // kept forever; since video frames vary in size almost every frame this
+    // grew without bound.
     let buf = {
-        let msg_size = data.len();
-
-        // Get or create a pool of this len
-        let pool = pools.entry(msg_size).or_insert_with_key(|size| {
-            let pool = gstreamer::BufferPool::new();
-            let mut pool_config = pool.config();
-            // Set a max buffers to ensure we don't grow in memory endlessly
-            pool_config.set_params(None, (*size) as u32, 8, 32);
-            pool.set_config(pool_config).unwrap();
-            pool.set_active(true).unwrap();
-            pool
-        });
-
-        // Get a buffer from the pool and then copy in the data
-        let gst_buf = {
-            let mut new_buf = pool.acquire_buffer(None).unwrap();
-            let gst_buf_mut = new_buf.get_mut().unwrap();
-            let time = ClockTime::from_useconds(ts.as_micros() as u64);
-            gst_buf_mut.set_dts(time);
-            gst_buf_mut.set_pts(time);
-            let mut gst_buf_data = gst_buf_mut.map_writable().unwrap();
-            gst_buf_data.copy_from_slice(data.as_slice());
-            drop(gst_buf_data);
-            new_buf
-        };
-
-        // Return the new buffer with the data
+        let mut gst_buf = gstreamer::Buffer::from_mut_slice(data);
+        let gst_buf_mut = gst_buf
+            .get_mut()
+            .expect("Newly created buffer should be writable");
+        let time = ClockTime::from_useconds(ts.as_micros() as u64);
+        gst_buf_mut.set_dts(time);
+        gst_buf_mut.set_pts(time);
         gst_buf
     };
 
@@ -423,11 +471,9 @@ fn send_to_appsrc(
             Ok(())
         }
         Err(FlowError::Flushing) => {
-            // Buffer is full just skip
-            log::info!(
-                "Buffer full on {} pausing stream until client consumes frames",
-                appsrc.name()
-            );
+            // The appsrc is not running (not yet started, suspended, or torn down).
+            // Drop the frame; `Liveness` decides when to give up entirely.
+            log::trace!("{} is flushing, dropping frame", appsrc.name());
             Ok(())
         }
         Err(e) => Err(anyhow!("Error in streaming: {e:?}")),
@@ -527,6 +573,10 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
+    // With block=false, max_bytes is only a signal threshold unless a leaky
+    // type is set; without it the internal queue grows without bound when a
+    // client consumes slower than the camera produces.
+    source.set_leaky_type(AppLeakyType::Downstream);
 
     let source = source
         .dynamic_cast::<Element>()
@@ -578,6 +628,10 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
+    // With block=false, max_bytes is only a signal threshold unless a leaky
+    // type is set; without it the internal queue grows without bound when a
+    // client consumes slower than the camera produces.
+    source.set_leaky_type(AppLeakyType::Downstream);
 
     let source = source
         .dynamic_cast::<Element>()
@@ -631,6 +685,10 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
+    // With block=false, max_bytes is only a signal threshold unless a leaky
+    // type is set; without it the internal queue grows without bound when a
+    // client consumes slower than the camera produces.
+    source.set_leaky_type(AppLeakyType::Downstream);
 
     let source = source
         .dynamic_cast::<Element>()
@@ -717,6 +775,10 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
+    // With block=false, max_bytes is only a signal threshold unless a leaky
+    // type is set; without it the internal queue grows without bound when a
+    // client consumes slower than the camera produces.
+    source.set_leaky_type(AppLeakyType::Downstream);
 
     source.set_caps(Some(
         &Caps::builder("audio/x-adpcm")
@@ -789,6 +851,10 @@ fn pipe_silence(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
+    // With block=false, max_bytes is only a signal threshold unless a leaky
+    // type is set; without it the internal queue grows without bound when a
+    // client consumes slower than the camera produces.
+    source.set_leaky_type(AppLeakyType::Downstream);
 
     let source = source
         .dynamic_cast::<Element>()

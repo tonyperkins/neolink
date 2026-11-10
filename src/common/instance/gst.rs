@@ -128,37 +128,53 @@ impl NeoInstance {
             let thread_camera = self.clone();
             tokio::spawn(
                 async move {
-                    loop {
-                        if let Err(e) = camera_permit.aquired_users().await {
-                            break AnyResult::Err(e);
-                        }
-                        log::debug!("Starting stream");
-                        tokio::select! {
-                            v = camera_permit.dropped_users() => {
-                                log::debug!("Dropped users: {v:?}");
-                                v
-                            },
-                            v = async {
-                                log::debug!("Getting stream");
-                                let mut stream = thread_camera.stream(stream).await?;
-                                log::debug!("Got stream");
-                                while let Some(media) = stream.recv().await {
-                                    media_tx.send(media).await?;
+                    let r = tokio::select! {
+                        // Stop as soon as the client drops its receiver, even while
+                        // paused. Otherwise this task (and the motion/PN tasks it owns)
+                        // lingers until the next motion event tries to send a frame.
+                        _ = media_tx.closed() => {
+                            log::debug!("Stream client dropped");
+                            AnyResult::Ok(())
+                        },
+                        v = async {
+                            loop {
+                                if let Err(e) = camera_permit.aquired_users().await {
+                                    break AnyResult::Err(e);
                                 }
-                                AnyResult::Ok(())
-                            } => {
-                                log::debug!("Stopped stream: {v:?}");
-                                v
-                            },
-                            v = tasks.next() => {
-                                log::debug!("Task failed: {v:?}");
-                                Err(anyhow!("Task ended prematurly: {v:?}"))
+                                log::debug!("Starting stream");
+                                tokio::select! {
+                                    v = camera_permit.dropped_users() => {
+                                        log::debug!("Dropped users: {v:?}");
+                                        v
+                                    },
+                                    v = async {
+                                        log::debug!("Getting stream");
+                                        let mut stream = thread_camera.stream(stream).await?;
+                                        log::debug!("Got stream");
+                                        while let Some(media) = stream.recv().await {
+                                            media_tx.send(media).await?;
+                                        }
+                                        AnyResult::Ok(())
+                                    } => {
+                                        log::debug!("Stopped stream: {v:?}");
+                                        v
+                                    },
+                                    v = tasks.next() => {
+                                        log::debug!("Task failed: {v:?}");
+                                        Err(anyhow!("Task ended prematurly: {v:?}"))
+                                    }
+                                }?;
+                                log::debug!("Pausing stream");
                             }
-                        }?;
-                        log::debug!("Pausing stream");
-                    }?;
+                        } => v,
+                    };
+                    // Dropping a JoinHandle does not stop its task, so abort the
+                    // motion/PN watchers explicitly.
+                    for task in tasks.iter() {
+                        task.abort();
+                    }
                     drop(counter); // Make sure counter is owned by this thread
-                    AnyResult::Ok(())
+                    r
                 }
                 .map(|e| {
                     log::debug!("Stream thread stopped {e:?}");
