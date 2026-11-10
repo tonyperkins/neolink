@@ -31,7 +31,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-2022, macos-15] # macos-15 is Apple Silicon (arm64)
+        # Windows is not built: it needs its GStreamer install repaired, and no one
+        # using this fork runs it. Re-add windows-2022 if that changes.
+        os: [ubuntu-22.04, macos-15] # macos-15 is Apple Silicon (arm64)
     steps:
       - uses: actions/checkout@v4
         name: Checkout onto ${{ runner.os }}
@@ -217,7 +219,7 @@ jobs:
         shell: bash
         run: |
           unset HAS_SECRET
-          if [ -n $SECRET ]; then HAS_SECRET='true' ; fi
+          if [ -n "$SECRET" ]; then HAS_SECRET='true' ; fi
           echo "HAS_SECRET_TOKEN=${HAS_SECRET}" >> $GITHUB_OUTPUT
         env:
           SECRET: "${{ secrets.DOCKER_TOKEN }}"
