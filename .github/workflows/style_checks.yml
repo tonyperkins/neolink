@@ -29,20 +29,22 @@ jobs:
           sudo apt update
           sudo apt install -y aptitude
           sudo aptitude install -y libgstrtspserver-1.0-dev libgstreamer1.0-dev libgtk2.0-dev protobuf-compiler
-      - name: Install nightly rust
+      # Stable, not nightly: nightly broke on its own when it stopped compiling
+      # an older dependency (rustix 0.37)
+      - name: Install stable rust
         run: |
-          rustup toolchain install nightly --component clippy
-          rustup override set nightly
+          rustup toolchain install stable --component clippy
+          rustup override set stable
       - name: Run clippy manually
         run: |
           echo "All Features"
-          cargo +nightly clippy --workspace --all-targets --all-features || exit 1
+          cargo clippy --workspace --all-targets --all-features || exit 1
           echo "No Features"
-          cargo +nightly clippy --workspace --all-targets --no-default-features || exit 1
+          cargo clippy --workspace --all-targets --no-default-features || exit 1
           echo "Gstreamer Only"
-          cargo +nightly clippy --workspace --all-targets --no-default-features --features=gstreamer || exit 1
+          cargo clippy --workspace --all-targets --no-default-features --features=gstreamer || exit 1
           echo "Pushnoti Only"
-          cargo +nightly clippy --workspace --all-targets --no-default-features --features=pushnoti || exit 1
+          cargo clippy --workspace --all-targets --no-default-features --features=pushnoti || exit 1
 
   check_fmt:
     needs: pre_job
