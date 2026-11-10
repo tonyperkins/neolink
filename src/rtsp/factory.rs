@@ -177,22 +177,38 @@ pub(super) async fn make_factory(
                         let mut media_rx = hub.subscribe();
 
                         log::trace!("{name}::{stream}: Learning camera stream type");
-                        // Learn the camera data type
-                        let mut buffer = vec![];
-                        let mut frame_count = 0usize;
-
-                        let mut stream_config = StreamConfig::new(&camera, stream).await?;
-                        while let Some(media) = media_rx.recv().await {
-                            stream_config.update_from_media(&media);
-                            buffer.push(media);
-                            if frame_count > 10
-                                || (stream_config.vid_type.is_some()
-                                    && stream_config.aud_type.is_some())
-                            {
-                                break;
+                        // Learn the camera data type. Bounded by the same timeout
+                        // as the factory's wait: past that the RTSP request has
+                        // already failed, and while the camera is down every client
+                        // retry would otherwise park a task (holding a hub
+                        // subscription and a pipeline bin) here until it returns.
+                        let learned = tokio::time::timeout(PIPELINE_BUILD_TIMEOUT, async {
+                            let mut buffer = vec![];
+                            let mut frame_count = 0usize;
+                            let mut stream_config = StreamConfig::new(&camera, stream).await?;
+                            while let Some(media) = media_rx.recv().await {
+                                stream_config.update_from_media(&media);
+                                buffer.push(media);
+                                if frame_count > 10
+                                    || (stream_config.vid_type.is_some()
+                                        && stream_config.aud_type.is_some())
+                                {
+                                    break;
+                                }
+                                frame_count += 1;
                             }
-                            frame_count += 1;
-                        }
+                            AnyResult::Ok((stream_config, buffer))
+                        })
+                        .await;
+                        let (stream_config, mut buffer) = match learned {
+                            Ok(learned) => learned?,
+                            Err(_) => {
+                                log::debug!(
+                                    "{name}::{stream}: Camera stream not ready within {PIPELINE_BUILD_TIMEOUT:?}, dropping client"
+                                );
+                                return AnyResult::Ok(());
+                            }
+                        };
 
                         log::trace!("{name}::{stream}: Building the pipeline");
                         // Build the right video pipeline
