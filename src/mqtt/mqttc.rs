@@ -570,21 +570,22 @@ impl LastWillMqtt {
         let thread_cancel = cancel.clone();
 
         tokio::task::spawn(async move {
-            loop {
-                let r = tokio::select! {
-                    _ = thread_cancel.cancelled() => AnyResult::Ok(()),
-                    v = connection.poll() =>  {
-                        v?;
-                        AnyResult::Ok(())
+            // Cancellation must end the loop. `cancelled()` stays ready once the
+            // token is cancelled, so treating it as one more iteration spun
+            // forever without yielding, pinning a runtime worker after every
+            // MQTT restart. (From victorpicaud/neolink@1e6ba5b, upstream #320.)
+            let r = loop {
+                tokio::select! {
+                    _ = thread_cancel.cancelled() => break AnyResult::Ok(()),
+                    v = connection.poll() => {
+                        if let Err(e) = v {
+                            break Err(e.into());
+                        }
                     },
-                };
-                if r.is_ok() {
-                    continue;
                 }
-                break r;
-            }?;
+            };
             drop(client);
-            AnyResult::Ok(())
+            r
         });
 
         Ok(LastWillMqtt { cancel })
