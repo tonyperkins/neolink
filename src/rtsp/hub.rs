@@ -7,9 +7,13 @@
 //! time out, and the result is a stall/reconnect loop.
 //!
 //! The hub runs one camera stream while at least one client is subscribed and
-//! fans the media out over a broadcast channel. It also caches the current GOP
-//! (everything since the last keyframe) so a new client can start decoding
-//! immediately.
+//! fans the media out over a broadcast channel. A new client starts at the
+//! next keyframe.
+//!
+//! Note: replaying a cached GOP to new clients was tried and removed. The burst
+//! of frames arriving at once breaks consumers that timestamp by wall clock
+//! (e.g. go2rtc with `-use_wallclock_as_timestamps 1`): they then report a
+//! 90000 fps stream and downstream CFR transcodes duplicate frames endlessly.
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -25,62 +29,22 @@ const MEDIA_STALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Frames buffered per client before it is considered lagging (~10s at 10fps + audio)
 const CHANNEL_CAPACITY: usize = 256;
-/// Bounds on the cached GOP. If the camera goes this long without a keyframe the
-/// cache is dropped rather than allowed to grow.
-const MAX_GOP_FRAMES: usize = 600;
-const MAX_GOP_BYTES: usize = 16 * 1024 * 1024;
-
-fn media_len(media: &BcMedia) -> usize {
-    match media {
-        BcMedia::Iframe(f) => f.data.len(),
-        BcMedia::Pframe(f) => f.data.len(),
-        BcMedia::Aac(a) => a.data.len(),
-        BcMedia::Adpcm(a) => a.data.len(),
-        BcMedia::InfoV1(_) | BcMedia::InfoV2(_) => 0,
-    }
-}
-
 #[derive(Default)]
 struct HubInner {
     tx: Option<broadcast::Sender<BcMedia>>,
     info: Option<BcMedia>,
-    gop: Vec<BcMedia>,
-    gop_bytes: usize,
 }
 
 impl HubInner {
     fn record(&mut self, media: &BcMedia) {
-        match media {
-            BcMedia::InfoV1(_) | BcMedia::InfoV2(_) => self.info = Some(media.clone()),
-            BcMedia::Iframe(_) => {
-                self.clear_gop();
-                self.push(media);
-            }
-            _ if !self.gop.is_empty() => self.push(media),
-            _ => {}
+        if matches!(media, BcMedia::InfoV1(_) | BcMedia::InfoV2(_)) {
+            self.info = Some(media.clone());
         }
-    }
-
-    fn push(&mut self, media: &BcMedia) {
-        let len = media_len(media);
-        if self.gop.len() >= MAX_GOP_FRAMES || self.gop_bytes + len > MAX_GOP_BYTES {
-            log::debug!("GOP cache limit reached, dropping cache until next keyframe");
-            self.clear_gop();
-            return;
-        }
-        self.gop_bytes += len;
-        self.gop.push(media.clone());
-    }
-
-    fn clear_gop(&mut self) {
-        self.gop.clear();
-        self.gop_bytes = 0;
     }
 
     fn reset(&mut self) {
         self.tx = None;
         self.info = None;
-        self.clear_gop();
     }
 }
 
@@ -123,19 +87,16 @@ impl StreamHub {
         if let Some(info) = inner.info.as_ref() {
             initial.push_back(info.clone());
         }
-        initial.extend(inner.gop.iter().cloned());
-        let has_keyframe = initial.iter().any(|m| matches!(m, BcMedia::Iframe(_)));
         log::debug!(
-            "{}::{}: Client subscribed ({} clients, {} cached frames)",
+            "{}::{}: Client subscribed ({} clients)",
             self.name,
             self.stream,
             tx.receiver_count(),
-            initial.len()
         );
         HubFeed {
             initial,
             rx,
-            need_keyframe: !has_keyframe,
+            need_keyframe: true,
         }
     }
 
@@ -203,8 +164,6 @@ impl StreamHub {
             if self.stop_if_unused(&tx) {
                 break;
             }
-            // Clients remain: the new camera stream starts a fresh GOP
-            self.inner.lock().expect("Hub lock poisoned").clear_gop();
             sleep(Duration::from_secs(1)).await;
             if self.stop_if_unused(&tx) {
                 break;
