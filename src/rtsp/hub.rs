@@ -15,9 +15,13 @@ use std::sync::{Arc, Mutex};
 
 use neolink_core::{bc_protocol::StreamKind, bcmedia::model::BcMedia};
 use tokio::sync::broadcast::{self, error::RecvError};
-use tokio::time::{interval, sleep, Duration};
+use tokio::time::{interval, sleep, Duration, Instant};
 
 use crate::common::NeoInstance;
+
+/// If the camera sends nothing for this long while clients are watching (and
+/// pausing is not enabled) the camera stream is restarted
+const MEDIA_STALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Frames buffered per client before it is considered lagging (~10s at 10fps + audio)
 const CHANNEL_CAPACITY: usize = 256;
@@ -152,15 +156,22 @@ impl StreamHub {
         let (name, stream) = (self.name.clone(), self.stream);
         log::info!("{name}::{stream}: Starting shared camera stream");
         'outer: loop {
+            // Pausing legitimately stops media, so only watch for stalls without it
+            let stall_watch = match self.camera.config().await {
+                Ok(config) => !config.borrow().pause.on_motion,
+                Err(_) => false,
+            };
             match self.camera.stream_while_live(stream).await {
                 Ok(mut media_rx) => {
                     // Wake periodically so we notice when all clients have left
                     // even if the camera is not sending (e.g. paused)
                     let mut idle = interval(Duration::from_secs(5));
+                    let mut last_media = Instant::now();
                     loop {
                         tokio::select! {
                             media = media_rx.recv() => match media {
                                 Some(media) => {
+                                    last_media = Instant::now();
                                     let mut inner = self.inner.lock().expect("Hub lock poisoned");
                                     inner.record(&media);
                                     let _ = tx.send(media);
@@ -170,7 +181,15 @@ impl StreamHub {
                                     break;
                                 }
                             },
-                            _ = idle.tick() => {}
+                            _ = idle.tick() => {
+                                if stall_watch && last_media.elapsed() > MEDIA_STALL_TIMEOUT {
+                                    log::warn!(
+                                        "{name}::{stream}: No media from camera for {:?}, restarting camera stream",
+                                        MEDIA_STALL_TIMEOUT
+                                    );
+                                    break;
+                                }
+                            }
                         }
                         if self.stop_if_unused(&tx) {
                             break 'outer;

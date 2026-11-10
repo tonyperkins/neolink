@@ -80,8 +80,10 @@ impl NeoCamThread {
                             break Err(e.into());
                         },
                         Err(_) => {
-                            // Timeout
-                            if missed_pings < 5 {
+                            // Timeout. Give up after 3 consecutive misses (~15-20s):
+                            // a dead Wi-Fi link otherwise took ~35s to notice, and
+                            // every second of that is a recording gap downstream.
+                            if missed_pings < 2 {
                                 missed_pings += 1;
                                 continue;
                             } else {

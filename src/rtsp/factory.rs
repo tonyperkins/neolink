@@ -404,7 +404,11 @@ struct MediaClock {
     frames: u64,
     camera_elapsed_us: u64,
     reported_fps: u32,
+    next_drift_report_us: u64,
 }
+
+/// How often (in stream time) to log the audio/video clock difference
+const DRIFT_REPORT_INTERVAL_US: u64 = 10 * 60 * 1_000_000;
 
 impl MediaClock {
     fn new(stream_config: &StreamConfig) -> Self {
@@ -417,6 +421,7 @@ impl MediaClock {
             frames: 0,
             camera_elapsed_us: 0,
             reported_fps: stream_config.fps,
+            next_drift_report_us: DRIFT_REPORT_INTERVAL_US,
         }
     }
 
@@ -442,6 +447,16 @@ impl MediaClock {
                 self.reported_fps,
                 observed_fps
             );
+        }
+        if self.vid_ts >= self.next_drift_report_us {
+            self.next_drift_report_us += DRIFT_REPORT_INTERVAL_US;
+            if self.aud_ts > 0 {
+                log::info!(
+                    "A/V clocks at {:.1} min: audio-video = {:+} ms",
+                    self.vid_ts as f64 / 60e6,
+                    (self.aud_ts as i64 - self.vid_ts as i64) / 1000
+                );
+            }
         }
         Duration::from_micros(self.vid_ts)
     }
