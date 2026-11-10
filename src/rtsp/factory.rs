@@ -206,6 +206,9 @@ pub(super) async fn make_factory(
                                 AnyResult::Ok(Some(src))
                             }
                             None => {
+                                log::warn!(
+                                    "{name}::{stream}: No video seen while learning the stream format, serving the test pattern"
+                                );
                                 build_unknown(&element, &config.splash_pattern.to_string())?;
                                 AnyResult::Ok(None)
                             }
@@ -574,16 +577,12 @@ fn send_to_appsrc(
         }
         Err(e) => Err(anyhow!("Error in streaming: {e:?}")),
     }?;
-    // Check if we need to pause
-    if appsrc.current_level_bytes() >= appsrc.max_bytes() * 2 / 3
-        && matches!(appsrc.current_state(), gstreamer::State::Paused)
-    {
-        appsrc.set_state(gstreamer::State::Playing).unwrap();
-    } else if appsrc.current_level_bytes() <= appsrc.max_bytes() / 3
-        && matches!(appsrc.current_state(), gstreamer::State::Playing)
-    {
-        appsrc.set_state(gstreamer::State::Paused).unwrap();
-    }
+    // Note: this used to toggle the appsrc between PAUSED and PLAYING based on
+    // its fill level. Changing a source's state waits for its streaming thread,
+    // so when a branch is blocked downstream (e.g. a client that only SETUPs
+    // video leaves the audio branch blocked) the call never returned and the
+    // feeder thread, and with it video, froze after ~20s. The appsrc queue is
+    // bounded by its leaky type, so no manual flow control is needed.
     Ok(())
 }
 fn check_live(app: &AppSrc) -> Result<()> {

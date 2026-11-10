@@ -26,6 +26,14 @@ use crate::common::NeoInstance;
 /// If the camera sends nothing for this long while clients are watching (and
 /// pausing is not enabled) the camera stream is restarted
 const MEDIA_STALL_TIMEOUT: Duration = Duration::from_secs(15);
+/// Keep the camera stream running this long after the last client leaves, so a
+/// reconnecting client (e.g. go2rtc) reuses it instead of restarting it
+const LINGER: Duration = Duration::from_secs(10);
+/// Time allowed for a dropped camera stream to finish stopping before a new one
+/// is started. The stop is sent asynchronously when the stream is dropped and
+/// waits up to 2s for the camera's reply; starting a new stream (same handle)
+/// before that completes let the late stop kill the new stream.
+const STOP_SETTLE: Duration = Duration::from_secs(3);
 
 /// Frames buffered per client before it is considered lagging (~10s at 10fps + audio)
 const CHANNEL_CAPACITY: usize = 256;
@@ -54,6 +62,9 @@ pub(super) struct StreamHub {
     stream: StreamKind,
     name: String,
     inner: Arc<Mutex<HubInner>>,
+    /// Held by the producer for its lifetime (including STOP_SETTLE after its
+    /// last camera stream) so camera streams never overlap
+    producer_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl StreamHub {
@@ -63,6 +74,7 @@ impl StreamHub {
             stream,
             name,
             inner: Default::default(),
+            producer_lock: Default::default(),
         }
     }
 
@@ -115,7 +127,10 @@ impl StreamHub {
 
     async fn produce(self, tx: broadcast::Sender<BcMedia>) {
         let (name, stream) = (self.name.clone(), self.stream);
+        let producer_lock = self.producer_lock.clone();
+        let _producer_guard = producer_lock.lock().await;
         log::info!("{name}::{stream}: Starting shared camera stream");
+        let mut idle_since: Option<Instant> = None;
         'outer: loop {
             // Pausing legitimately stops media, so only watch for stalls without it
             let stall_watch = match self.camera.config().await {
@@ -152,8 +167,13 @@ impl StreamHub {
                                 }
                             }
                         }
-                        if self.stop_if_unused(&tx) {
-                            break 'outer;
+                        if tx.receiver_count() == 0 {
+                            let since = *idle_since.get_or_insert_with(Instant::now);
+                            if since.elapsed() >= LINGER && self.stop_if_unused(&tx) {
+                                break 'outer;
+                            }
+                        } else {
+                            idle_since = None;
                         }
                     }
                 }
@@ -164,13 +184,15 @@ impl StreamHub {
             if self.stop_if_unused(&tx) {
                 break;
             }
-            sleep(Duration::from_secs(1)).await;
+            sleep(STOP_SETTLE).await;
             if self.stop_if_unused(&tx) {
                 break;
             }
             log::info!("{name}::{stream}: Restarting shared camera stream");
         }
         log::info!("{name}::{stream}: Stopped shared camera stream (no clients)");
+        // Keep holding the producer lock while the camera stream finishes stopping
+        sleep(STOP_SETTLE).await;
     }
 }
 
@@ -191,8 +213,12 @@ impl HubFeed {
                 self.need_keyframe = false;
                 true
             }
-            BcMedia::Pframe(_) => !self.need_keyframe,
-            _ => true,
+            BcMedia::InfoV1(_) | BcMedia::InfoV2(_) => true,
+            // Hold back audio as well as P-frames until the keyframe. The
+            // factory learns the stream format from the first ~10 frames; if
+            // those were all audio it concluded there was no video and served
+            // the 20s "Stream not Ready" test pattern instead of the camera.
+            _ => !self.need_keyframe,
         }
     }
 
