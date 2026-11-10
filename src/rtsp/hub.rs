@@ -246,3 +246,86 @@ impl HubFeed {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use neolink_core::bcmedia::model::{BcMediaAac, BcMediaIframe, BcMediaPframe, VideoType};
+
+    fn iframe() -> BcMedia {
+        BcMedia::Iframe(BcMediaIframe {
+            video_type: VideoType::H264,
+            microseconds: 0,
+            time: None,
+            data: vec![],
+        })
+    }
+    fn pframe() -> BcMedia {
+        BcMedia::Pframe(BcMediaPframe {
+            video_type: VideoType::H264,
+            microseconds: 0,
+            data: vec![],
+        })
+    }
+    fn aac() -> BcMedia {
+        BcMedia::Aac(BcMediaAac { data: vec![] })
+    }
+    fn kind(m: &BcMedia) -> &'static str {
+        match m {
+            BcMedia::Iframe(_) => "I",
+            BcMedia::Pframe(_) => "P",
+            BcMedia::Aac(_) => "A",
+            _ => "?",
+        }
+    }
+
+    async fn drain(feed: &mut HubFeed) -> String {
+        let mut out = String::new();
+        while let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(20), feed.recv()).await {
+            out.push_str(kind(&m));
+        }
+        out
+    }
+
+    fn feed(capacity: usize) -> (broadcast::Sender<BcMedia>, HubFeed) {
+        let (tx, rx) = broadcast::channel(capacity);
+        let feed = HubFeed {
+            initial: VecDeque::new(),
+            rx,
+            need_keyframe: true,
+        };
+        (tx, feed)
+    }
+
+    #[tokio::test]
+    async fn new_client_starts_at_keyframe() {
+        let (tx, mut feed) = feed(16);
+        for m in [aac(), pframe(), aac(), iframe(), aac(), pframe()] {
+            tx.send(m).unwrap();
+        }
+        // Audio and P-frames before the first keyframe are skipped
+        assert_eq!(drain(&mut feed).await, "IAP");
+    }
+
+    #[tokio::test]
+    async fn lagging_client_waits_for_next_keyframe() {
+        let (tx, mut feed) = feed(4);
+        tx.send(iframe()).unwrap();
+        assert_eq!(drain(&mut feed).await, "I");
+        // Overflow the channel so the client lags
+        for _ in 0..6 {
+            tx.send(pframe()).unwrap();
+        }
+        tx.send(aac()).unwrap();
+        tx.send(iframe()).unwrap();
+        tx.send(pframe()).unwrap();
+        assert_eq!(drain(&mut feed).await, "IP");
+    }
+
+    #[tokio::test]
+    async fn closed_channel_ends_feed() {
+        let (tx, mut feed) = feed(4);
+        drop(tx);
+        assert!(feed.recv().await.is_none());
+    }
+}

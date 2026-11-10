@@ -415,15 +415,18 @@ const DRIFT_REPORT_INTERVAL_US: u64 = 10 * 60 * 1_000_000;
 
 impl MediaClock {
     fn new(stream_config: &StreamConfig) -> Self {
-        let fps = stream_config.fps.max(1);
+        Self::with_fps(stream_config.fps)
+    }
+
+    fn with_fps(reported_fps: u32) -> Self {
         Self {
             vid_ts: 0,
             aud_ts: 0,
             last_camera_us: None,
-            nominal_frame_us: 1_000_000 / fps as u64,
+            nominal_frame_us: 1_000_000 / reported_fps.max(1) as u64,
             frames: 0,
             camera_elapsed_us: 0,
-            reported_fps: stream_config.fps,
+            reported_fps,
             next_drift_report_us: DRIFT_REPORT_INTERVAL_US,
         }
     }
@@ -1121,4 +1124,76 @@ fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
 fn buffer_size(bitrate: u32) -> u32 {
     // 0.1 seconds (according to bitrate) or 4kb what ever is larger
     std::cmp::max(bitrate * 2 / 8u32, 4u32 * 1024u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn us(d: Duration) -> u128 {
+        d.as_micros()
+    }
+
+    #[test]
+    fn video_uses_camera_frame_clock() {
+        // Camera claims 20fps but sends 10fps: timestamps follow the camera
+        let mut clock = MediaClock::with_fps(20);
+        assert_eq!(us(clock.next_video(1_000_000)), 0);
+        assert_eq!(us(clock.next_video(1_100_000)), 100_000);
+        assert_eq!(us(clock.next_video(1_200_000)), 200_000);
+    }
+
+    #[test]
+    fn video_survives_u32_wrap() {
+        let mut clock = MediaClock::with_fps(10);
+        let start = u32::MAX - 50_000;
+        assert_eq!(us(clock.next_video(start)), 0);
+        // Wraps past u32::MAX (~71.6 min of camera time)
+        assert_eq!(us(clock.next_video(start.wrapping_add(100_000))), 100_000);
+        assert_eq!(us(clock.next_video(start.wrapping_add(200_000))), 200_000);
+    }
+
+    #[test]
+    fn video_jumps_use_nominal_frame_time() {
+        let mut clock = MediaClock::with_fps(10);
+        clock.next_video(5_000_000);
+        // Repeated timestamp
+        assert_eq!(us(clock.next_video(5_000_000)), 100_000);
+        // Large forward jump (e.g. after a reconnect)
+        assert_eq!(us(clock.next_video(60_000_000)), 200_000);
+        // Backwards jump (wrapping_sub gives a huge delta)
+        assert_eq!(us(clock.next_video(1_000_000)), 300_000);
+        // Then normal again
+        assert_eq!(us(clock.next_video(1_100_000)), 400_000);
+    }
+
+    #[test]
+    fn video_timestamps_exceed_u32_micros() {
+        // PTS must keep increasing past 71.6 minutes of stream time
+        let mut clock = MediaClock::with_fps(10);
+        let mut cam: u32 = 0;
+        let mut last = Duration::ZERO;
+        for _ in 0..50_000 {
+            last = clock.next_video(cam);
+            cam = cam.wrapping_add(100_000);
+        }
+        assert_eq!(us(last), 49_999 * 100_000);
+        assert!(us(last) > u32::MAX as u128);
+    }
+
+    #[test]
+    fn audio_advances_by_duration_with_fallback() {
+        let mut clock = MediaClock::with_fps(10);
+        assert_eq!(us(clock.next_audio(Some(64_000))), 0);
+        assert_eq!(us(clock.next_audio(None)), 64_000);
+        assert_eq!(us(clock.next_audio(Some(32_000))), 128_000);
+        assert_eq!(us(clock.next_audio(None)), 160_000);
+    }
+
+    #[test]
+    fn zero_fps_does_not_panic() {
+        let mut clock = MediaClock::with_fps(0);
+        clock.next_video(0);
+        assert_eq!(us(clock.next_video(0)), 1_000_000);
+    }
 }
