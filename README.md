@@ -386,6 +386,7 @@ debug = false # Displays Debug XML messages from camera
 enabled = true # Enable or Disable the camera
 update_time = false # When camera connects, force the setting of the camera date/time to now. The default is false
 print_format = "None"  # Type of format that logs are displayed in (None, Human, Xml). The default is None
+audio = "pcm" # Audio on the RTSP stream: "pcm" (default), "aac" or "none"
 ```
 
 - **Debug:** Will dump the various XMLs from the camera as they are recieved
@@ -401,6 +402,18 @@ ssue a user had)
 
 - **print_format:** Used for adjusting printing of some values mostly, battery
 messages
+
+- **audio:** The audio format served on the RTSP stream.
+  - `"pcm"` (default): uncompressed 16-bit PCM, as neolink always served before.
+  - `"aac"`: if the camera sends AAC (e.g. the E1 Pro), its audio is passed
+    through untouched. If it sends ADPCM, neolink encodes it to AAC, which
+    needs an AAC encoder such as `avenc_aac` (gst-libav), `fdkaacenc` or
+    `voaacenc`; without one it falls back to PCM and logs a warning.
+  - `"none"`: no audio track.
+
+  PCM cannot be stored in MP4, so recorders such as Frigate either have to
+  transcode it or fail on it. With `"aac"` the stream can be recorded with
+  `-c copy`.
 
 ### Pause
 

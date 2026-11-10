@@ -58,6 +58,11 @@ address = "192.168.1.187:9000"
 # If your device has user connection limits try a single stream instead.
 # stream = "mainStream"
 
+# Audio served on the RTSP stream: "pcm" (the default), "aac" or "none".
+# "aac" passes the camera's AAC through, or encodes ADPCM to AAC. Use it with
+# recorders that store MP4 (e.g. Frigate), which cannot hold PCM.
+# audio = "aac"
+
 # By default neolink will use any means to connect to the camera
 # from a UID
 # This include relaying via reolink servers
