@@ -50,8 +50,8 @@ Install the latest [gstreamer](https://gstreamer.freedesktop.org/download/)
 (1.20.5 as of writing this).
 
 - **Windows**: ensure you install `full` when prompted in the MSI options.
-- **Mac**: Install the dpkg version on the official gstreamer website over
-  the brew version
+- **Mac**: see [docs/macos.md](docs/macos.md) for a native build and
+  launchd service using Homebrew's `gstreamer`
 - **Ubuntu/Debian**: These packages should work
 
 ```bash
@@ -68,9 +68,7 @@ sudo apt install \
 
 - **Windows**: You may also need to
   [install openssl](https://wiki.openssl.org/index.php/Binaries)
-- **Macos**: You may also need to
-  [install openssl](https://wiki.openssl.org/index.php/Binaries) or
-  `brew install openssl@1.1`
+- **Macos**: `brew install openssl@3` (see [docs/macos.md](docs/macos.md))
 - **Ubuntu/Debian**: Install the `libssl` package
 
 Make a config file see below.

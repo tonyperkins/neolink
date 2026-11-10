@@ -7,7 +7,7 @@ use log::*;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::mpsc::{channel, error::TrySendError, Sender};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
@@ -89,14 +89,15 @@ impl BcConnection {
         rx_thread.spawn(async move {
             tokio::select! {
                 _ = thread_cancel.cancelled() => Result::Ok(()),
-                v = async {
-                    loop {
-                        if let n @ Err(_) = poller.run().await {
-                            trace!("Polling has ended");
-                            return n;
-                        }
-                    }
-                }=> v
+                // `run` only returns once polling is over: with an error, or
+                // with `Ok` once every command sender is gone. Calling it again
+                // after `Ok` returned immediately, forever, pinning a core.
+                // (Same fix as vertoforce/neolink@e4cb31d and
+                // victorpicaud/neolink@1e6ba5b.)
+                v = poller.run() => {
+                    trace!("Polling has ended");
+                    v
+                }
             }
         });
 
@@ -309,25 +310,32 @@ impl Poller {
                                         None
                                     };
                                     if let Some(sender) = sender {
-                                        if sender.capacity() == 0 {
-                                            warn!("Reaching limit of channel");
-                                            warn!(
-                                                "Remaining: {} of {} message space for {} (ID: {})",
-                                                sender.capacity(),
-                                                sender.max_capacity(),
-                                                &msg_num,
-                                                &msg_id
-                                            );
-                                        } else {
-                                            trace!(
-                                                "Remaining: {} of {} message space for {} (ID: {})",
-                                                sender.capacity(),
-                                                sender.max_capacity(),
-                                                &msg_num,
-                                                &msg_id
-                                            );
+                                        // Never wait on a subscriber here. This loop routes
+                                        // every message on the connection, ping replies
+                                        // included, so one full queue (e.g. a video stream
+                                        // whose consumer stalled) used to stop them all
+                                        // until the camera dropped the connection. A
+                                        // subscriber that falls this far behind has its
+                                        // subscription ended instead: it receives what is
+                                        // queued and then an error, so a video stream
+                                        // restarts cleanly rather than continuing with a
+                                        // gap. (The same problem was fixed in upstream
+                                        // PR #399 and in several forks.)
+                                        match sender.try_send(Ok(response)) {
+                                            Ok(()) => {}
+                                            Err(TrySendError::Full(_)) => {
+                                                warn!(
+                                                    "Subscriber to message {} (num {}) fell {} messages behind, ending its subscription",
+                                                    msg_id,
+                                                    msg_num,
+                                                    sender.max_capacity()
+                                                );
+                                                occ.remove(&Some(msg_num));
+                                            }
+                                            Err(TrySendError::Closed(_)) => {
+                                                occ.remove(&Some(msg_num));
+                                            }
                                         }
-                                        let _ = sender.send(Ok(response)).await;
                                     } else {
                                         trace!(
                                             "Ignoring uninteresting message id {} (number: {})",
@@ -348,9 +356,11 @@ impl Poller {
                             }
                         }
                         Err(e) => {
+                            // Best effort and never waiting: a subscriber whose queue
+                            // is full still sees its channel close when it is cleared
                             for sub in self.subscribers.num.values() {
                                 for sender in sub.values() {
-                                    let _ = sender.send(Err(e.clone())).await;
+                                    let _ = sender.try_send(Err(e.clone()));
                                 }
                             }
                             self.subscribers.num.clear();
@@ -401,5 +411,88 @@ impl Poller {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn msg(msg_id: u32, msg_num: u16) -> Bc {
+        Bc::new_from_meta(BcMeta {
+            msg_id,
+            channel_id: 0,
+            stream_type: 0,
+            response_code: 200,
+            msg_num,
+            class: 0x0000,
+        })
+    }
+
+    fn poller() -> (Poller, Sender<PollCommand>) {
+        let (sink, _) = channel::<Result<Bc>>(1);
+        let (commander, commanded) = channel::<PollCommand>(100);
+        (
+            Poller {
+                subscribers: Default::default(),
+                sink,
+                reciever: ReceiverStream::new(commanded),
+            },
+            commander,
+        )
+    }
+
+    /// `Poller::run` returns `Ok` as soon as its commands close, so it must be
+    /// called once and not in a loop
+    #[tokio::test]
+    async fn poller_run_returns_once_commands_close() {
+        let (mut poller, commander) = poller();
+        drop(commander);
+        let result = tokio::time::timeout(Duration::from_secs(1), poller.run())
+            .await
+            .expect("Poller::run did not return after its commands closed");
+        assert!(result.is_ok());
+    }
+
+    /// A subscriber that stops reading must not hold up other subscribers
+    /// (e.g. ping replies) and has its own subscription ended instead
+    #[tokio::test]
+    async fn stalled_subscriber_does_not_block_others() {
+        let (mut poller, commander) = poller();
+        let (stalled_tx, mut stalled_rx) = channel(2);
+        let (other_tx, mut other_rx) = channel(10);
+        commander
+            .send(PollCommand::AddSubscriber(3, Some(1), stalled_tx))
+            .await
+            .unwrap();
+        commander
+            .send(PollCommand::AddSubscriber(93, Some(2), other_tx))
+            .await
+            .unwrap();
+        // Overflow the stalled subscriber, then message the other one
+        for _ in 0..5 {
+            commander
+                .send(PollCommand::Bc(Box::new(Ok(msg(3, 1)))))
+                .await
+                .unwrap();
+        }
+        commander
+            .send(PollCommand::Bc(Box::new(Ok(msg(93, 2)))))
+            .await
+            .unwrap();
+        drop(commander);
+
+        tokio::time::timeout(Duration::from_secs(1), poller.run())
+            .await
+            .expect("Poller blocked on a stalled subscriber")
+            .unwrap();
+
+        let delivered = other_rx.recv().await.unwrap().unwrap();
+        assert_eq!(delivered.meta.msg_id, 93);
+        // The stalled subscriber gets what fit in its queue, then its channel ends
+        assert!(stalled_rx.recv().await.unwrap().is_ok());
+        assert!(stalled_rx.recv().await.unwrap().is_ok());
+        assert!(stalled_rx.recv().await.is_none());
     }
 }

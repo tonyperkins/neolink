@@ -31,7 +31,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-2022, macos-12, macos-14] # macos-14+ is arm64
+        # Windows is not built: it needs its GStreamer install repaired, and no one
+        # using this fork runs it. Re-add windows-2022 if that changes.
+        # macos-15 is Apple Silicon (arm64); macos-14 is retired. If the macOS job
+        # is cancelled with "not acquired by Runner", GitHub had no arm64 runner
+        # free: re-run that job.
+        os: [ubuntu-22.04, macos-15]
     steps:
       - uses: actions/checkout@v4
         name: Checkout onto ${{ runner.os }}
@@ -86,16 +91,12 @@ jobs:
       - if: runner.os == 'macOS'
         name: Install macOS deps
         run: |
-          curl -L 'https://gstreamer.freedesktop.org/data/pkg/osx/1.20.4/gstreamer-1.0-devel-1.20.4-universal.pkg' -o "$(pwd)/gstreamer-devel.pkg"
-          sudo installer -verbose -pkg "$(pwd)/gstreamer-devel.pkg" -target /
-          PKG_CONFIG_PATH="/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-          PKG_CONFIG_GSTREAMER_1_0_PREFIX="/Library/Frameworks/GStreamer.framework/Versions/1.0"
-          echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}" >> "${GITHUB_ENV}"
-          echo "PKG_CONFIG_GSTREAMER_1_0_PREFIX=${PKG_CONFIG_GSTREAMER_1_0_PREFIX}" >> "${GITHUB_ENV}"
-          echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}"
-          brew install pkg-config protobuf openssl@1.1
-          echo "OPENSSL_INCLUDE_DIR=$(brew --prefix openssl@1.1)/include/" >>  "${GITHUB_ENV}"
-          echo "OPENSSL_LIB_DIR=$(brew --prefix openssl@1.1)/lib/" >>  "${GITHUB_ENV}"
+          # Homebrew's gstreamer formula includes gst-rtsp-server and the plugins
+          # neolink needs. The freedesktop.org .pkg route is unreliable from CI
+          # runners, and openssl@1.1 is no longer in Homebrew.
+          brew install pkg-config protobuf openssl@3 gstreamer
+          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "${GITHUB_ENV}"
+          echo "PKG_CONFIG_PATH=$(brew --prefix)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig" >> "${GITHUB_ENV}"
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -121,6 +122,16 @@ jobs:
           # pkg-config --variable pc_path pkg-config
           export JEMALLOC_SYS_WITH_LG_PAGE=16
           cargo  build --release --all-features
+      - if: runner.os == 'macOS'
+        name: Unit tests (macOS)
+        run: cargo test --release --all-features --workspace
+      - if: runner.os == 'macOS'
+        name: Smoke test (macOS)
+        run: |
+          ./target/release/neolink --version
+          # The RTSP server and its plugins must load from Homebrew's GStreamer
+          gst-inspect-1.0 rtph264pay >/dev/null
+          gst-inspect-1.0 appsrc >/dev/null
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.os }}
@@ -199,19 +210,32 @@ jobs:
           name: release-${{ matrix.arch }}-bookworm
           path: "target/${{ matrix.target }}/release/neolink*"
 
+  docker_token:
+    name: Check for a Docker Hub token
+    runs-on: ubuntu-latest
+    outputs:
+      present: ${{ steps.check.outputs.present }}
+    steps:
+      - id: check
+        run: if [ -n "$SECRET" ]; then echo "present=true" >> "$GITHUB_OUTPUT"; fi
+        env:
+          SECRET: "${{ secrets.DOCKER_TOKEN }}"
+
   push_to_registry:
     name: Build Docker image
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
+    # Only where a Docker Hub token is configured (forks usually have none)
+    if: needs.docker_token.outputs.present == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name)
     runs-on: ubuntu-latest
     needs:
       - "cross"
+      - "docker_token"
     steps:
       - name: Check token is set
         id: vars
         shell: bash
         run: |
           unset HAS_SECRET
-          if [ -n $SECRET ]; then HAS_SECRET='true' ; fi
+          if [ -n "$SECRET" ]; then HAS_SECRET='true' ; fi
           echo "HAS_SECRET_TOKEN=${HAS_SECRET}" >> $GITHUB_OUTPUT
         env:
           SECRET: "${{ secrets.DOCKER_TOKEN }}"

@@ -70,6 +70,7 @@ use tokio_util::sync::CancellationToken;
 mod cmdline;
 mod factory;
 mod gst;
+mod hub;
 mod stream;
 
 use crate::common::{NeoInstance, NeoReactor};

@@ -7,6 +7,9 @@ use nom::{
     sequence::*, Parser,
 };
 
+/// Upper bound on a message body (video frames are well under this)
+const MAX_BODY_LEN: u32 = 32 * 1024 * 1024;
+
 type IResult<I, O, E = nom::error::VerboseError<I>> = Result<(I, O), nom::Err<E>>;
 
 impl Bc {
@@ -93,6 +96,13 @@ fn bc_modern_msg<'a>(
     // If missing payload_offset treat all as payload
     let ext_len = header.payload_offset.unwrap_or_default();
 
+    if ext_len > header.body_len {
+        return Err(nom::Err::Error(make_error(
+            buf,
+            "Payload offset is beyond the end of the body",
+            ErrorKind::Verify,
+        )));
+    }
     let (buf, ext_buf) = take(ext_len)(buf)?;
     let payload_len = header.body_len - ext_len;
     let (buf, payload_buf) = take(payload_len)(buf)?;
@@ -227,7 +237,12 @@ fn bc_header(buf: &[u8]) -> IResult<&[u8], BcHeader> {
         verify(le_u32, |x| *x == MAGIC_HEADER || *x == MAGIC_HEADER_REV),
     )(buf)?;
     let (buf, msg_id) = error_context("MsgID missing", le_u32)(buf)?;
-    let (buf, body_len) = error_context("BodyLen missing", le_u32)(buf)?;
+    // Bound the body length: a corrupted header would otherwise make the codec
+    // wait for (and buffer) up to 4GiB
+    let (buf, body_len) = error_context(
+        "BodyLen missing or implausibly large",
+        verify(le_u32, |x| *x <= MAX_BODY_LEN),
+    )(buf)?;
     let (buf, channel_id) = error_context("ChannelID missing", le_u8)(buf)?;
     let (buf, stream_type) = error_context("StreamType missing", le_u8)(buf)?;
     let (buf, msg_num) = error_context("MsgNum missing", le_u16)(buf)?;
