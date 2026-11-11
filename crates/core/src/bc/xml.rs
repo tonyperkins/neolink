@@ -694,7 +694,9 @@ pub struct Preset {
     /// The preset name
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Command: Known values: `"toPos"` and `"setPos"`
+    /// Command: Known values: `"toPos"` and `"setPos"`. Empty in the list the
+    /// camera returns for a preset query.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub command: String,
 }
 
@@ -1963,4 +1965,34 @@ fn test_empty_floodlight_status_list() {
         } if version == "1.1" && floodlight_status_list.is_empty() => {}
         _ => panic!(),
     }
+}
+
+#[test]
+fn test_preset_list_without_command() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <PtzPreset version="1.1">
+        <channelId>0</channelId>
+        <presetList>
+        <preset>
+        <id>0</id>
+        <name>Preset 1</name>
+        </preset>
+        <preset>
+        <id>1</id>
+        <name>Door</name>
+        </preset>
+        </presetList>
+        </PtzPreset>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let presets = b.ptz_preset.unwrap().preset_list.preset;
+    assert_eq!(presets.len(), 2);
+    assert_eq!(presets[1].id, 1);
+    assert_eq!(presets[1].name.as_deref(), Some("Door"));
+    assert!(presets[1].command.is_empty());
 }
