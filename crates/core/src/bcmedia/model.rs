@@ -247,6 +247,28 @@ impl BcMediaAac {
         let duration = samples * MICROSECONDS / sample_frequency;
         Some(duration)
     }
+
+    /// Mark every ADTS frame in the payload as MPEG-4 AAC.
+    ///
+    /// Some cameras (e.g. the original E1) set the ADTS ID bit, which flags the
+    /// stream as MPEG-2 AAC. The AAC-LC bitstream is the same in both, but RTP
+    /// payloaders for RFC 3640 only accept MPEG-4, so clearing the bit lets the
+    /// audio be passed through without re-encoding. Stops at the first byte
+    /// that is not an ADTS frame header.
+    pub fn normalize_to_mpeg4(&mut self) {
+        let data = &mut self.data;
+        let mut pos = 0;
+        while pos + 7 <= data.len() && data[pos] == 0xFF && (data[pos + 1] & 0xF0) == 0xF0 {
+            data[pos + 1] &= !0x08;
+            let frame_len = (((data[pos + 3] & 0x03) as usize) << 11)
+                | ((data[pos + 4] as usize) << 3)
+                | ((data[pos + 5] as usize) >> 5);
+            if frame_len < 7 {
+                break;
+            }
+            pos += frame_len;
+        }
+    }
 }
 
 pub(super) const MAGIC_HEADER_BCMEDIA_ADPCM: u32 = 0x62773130;
@@ -291,6 +313,55 @@ impl BcMediaAdpcm {
         const MICROSECONDS: u32 = 1000000;
         let duration = samples * MICROSECONDS / SAMPLE_FREQUENCY;
         Some(duration)
+    }
+}
+
+#[cfg(test)]
+mod aac_tests {
+    use super::BcMediaAac;
+
+    /// An ADTS header for a frame of `len` bytes (header included), 16 kHz mono.
+    fn adts(len: usize, mpeg2: bool) -> Vec<u8> {
+        let mut f = vec![
+            0xFF,
+            if mpeg2 { 0xF9 } else { 0xF1 },
+            0x60, // AAC LC, 16 kHz
+            0x40 | ((len >> 11) & 0x03) as u8,
+            ((len >> 3) & 0xFF) as u8,
+            (((len & 0x07) << 5) as u8) | 0x1F,
+            0xFC,
+        ];
+        f.resize(len, 0xAA);
+        f
+    }
+
+    #[test]
+    fn mpeg2_frames_become_mpeg4() {
+        let mut data = adts(20, true);
+        data.extend(adts(30, true));
+        let mut aac = BcMediaAac { data };
+        aac.normalize_to_mpeg4();
+        assert_eq!(aac.data[1], 0xF1);
+        assert_eq!(aac.data[21], 0xF1);
+        // Payload untouched
+        assert!(aac.data[7..20].iter().all(|&b| b == 0xAA));
+        assert_eq!(aac.duration(), Some(64000));
+    }
+
+    #[test]
+    fn mpeg4_and_junk_left_alone() {
+        let mut data = adts(20, false);
+        data.extend([0x00, 0xF9, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let orig = data.clone();
+        let mut aac = BcMediaAac { data };
+        aac.normalize_to_mpeg4();
+        assert_eq!(aac.data, orig);
+
+        let mut short = BcMediaAac {
+            data: vec![0xFF, 0xF9],
+        };
+        short.normalize_to_mpeg4();
+        assert_eq!(short.data, vec![0xFF, 0xF9]);
     }
 }
 

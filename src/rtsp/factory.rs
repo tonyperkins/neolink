@@ -518,7 +518,10 @@ fn send_to_sources(
     clock: &mut MediaClock,
 ) -> AnyResult<()> {
     match data {
-        BcMedia::Aac(aac) => {
+        BcMedia::Aac(mut aac) => {
+            // The original E1 flags its ADTS frames as MPEG-2, which
+            // rtpmp4gpay refuses (not-negotiated, then RTSP 503).
+            aac.normalize_to_mpeg4();
             let ts = clock.next_audio(aac.duration());
             if let Some(aud_src) = aud_src.as_ref() {
                 log::trace!("Sending AAC: {:?}", ts);
